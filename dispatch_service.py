@@ -23,6 +23,24 @@ class AlertSeverity(str, Enum):
     CRITICAL = "critical"
 
 
+class UrgencyLevel(int, Enum):
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+    CRITICAL = 4
+
+
+DEFAULT_URGENCY_MAP: Dict[RepairType, UrgencyLevel] = {
+    RepairType.PLUMBING: UrgencyLevel.CRITICAL,
+    RepairType.ELECTRICAL: UrgencyLevel.CRITICAL,
+    RepairType.DOOR_LOCK: UrgencyLevel.HIGH,
+    RepairType.HVAC: UrgencyLevel.MEDIUM,
+    RepairType.WINDOW: UrgencyLevel.MEDIUM,
+    RepairType.CARPENTRY: UrgencyLevel.LOW,
+    RepairType.PAINTING: UrgencyLevel.LOW,
+}
+
+
 @dataclass
 class Location:
     x: float
@@ -51,10 +69,18 @@ class RepairOrder:
     description: str
     location: Location
     priority: int = 1
+    urgency: Optional[UrgencyLevel] = None
     created_at: datetime = field(default_factory=datetime.now)
     assigned_worker: Optional[str] = None
     status: str = "pending"
     queue_wait_since: Optional[datetime] = None
+
+    def get_urgency(self, urgency_map: Optional[Dict[RepairType, UrgencyLevel]] = None) -> UrgencyLevel:
+        if self.urgency is not None:
+            return self.urgency
+        if urgency_map and self.repair_type in urgency_map:
+            return urgency_map[self.repair_type]
+        return UrgencyLevel.MEDIUM
 
 
 @dataclass
@@ -84,12 +110,14 @@ class DispatchService:
     def __init__(
         self,
         workers: Optional[List[Worker]] = None,
-        skill_weight: float = 0.4,
-        distance_weight: float = 0.35,
-        load_weight: float = 0.2,
+        skill_weight: float = 0.35,
+        distance_weight: float = 0.30,
+        load_weight: float = 0.15,
         rating_weight: float = 0.05,
+        urgency_weight: float = 0.15,
         max_distance: float = 10.0,
         alert_callback: Optional[Callable[[AdminAlert], None]] = None,
+        urgency_map: Optional[Dict[RepairType, UrgencyLevel]] = None,
     ):
         self.workers: List[Worker] = workers if workers else []
         self.orders: Dict[str, RepairOrder] = {}
@@ -97,8 +125,10 @@ class DispatchService:
         self.distance_weight = distance_weight
         self.load_weight = load_weight
         self.rating_weight = rating_weight
+        self.urgency_weight = urgency_weight
         self.max_distance = max_distance
         self.alert_callback = alert_callback
+        self.urgency_map: Dict[RepairType, UrgencyLevel] = urgency_map if urgency_map else dict(DEFAULT_URGENCY_MAP)
         self._worker_orders: Dict[str, List[str]] = {}
         self._waiting_queue: List[Tuple] = []
         self._waiting_set: set = set()
@@ -134,22 +164,32 @@ class DispatchService:
     def _calculate_rating_score(self, worker: Worker) -> float:
         return max(0.0, min(worker.rating, 5.0)) / 5.0
 
+    def _calculate_urgency_score(self, order: RepairOrder) -> float:
+        urgency = order.get_urgency(self.urgency_map)
+        return urgency.value / UrgencyLevel.CRITICAL.value
+
+    def _get_effective_priority(self, order: RepairOrder) -> float:
+        urgency = order.get_urgency(self.urgency_map)
+        return order.priority * urgency.value
+
     def _calculate_total_score(
         self, worker: Worker, order: RepairOrder
-    ) -> Tuple[float, float, float, float, float]:
+    ) -> Tuple[float, float, float, float, float, float]:
         skill_score = self._calculate_skill_score(worker, order)
         distance_score = self._calculate_distance_score(worker, order)
         load_score = self._calculate_load_score(worker)
         rating_score = self._calculate_rating_score(worker)
+        urgency_score = self._calculate_urgency_score(order)
 
         total_score = (
             skill_score * self.skill_weight
             + distance_score * self.distance_weight
             + load_score * self.load_weight
             + rating_score * self.rating_weight
+            + urgency_score * self.urgency_weight
         )
 
-        return total_score, skill_score, distance_score, load_score, rating_score
+        return total_score, skill_score, distance_score, load_score, rating_score, urgency_score
 
     def _get_eligible_workers(self, order: RepairOrder) -> List[Worker]:
         return [
@@ -206,18 +246,27 @@ class DispatchService:
 
         order.status = "waiting"
         order.queue_wait_since = datetime.now()
+        effective_priority = self._get_effective_priority(order)
         heapq.heappush(
             self._waiting_queue,
-            (-order.priority, order.created_at.timestamp(), order.order_id),
+            (-effective_priority, order.created_at.timestamp(), order.order_id),
         )
         self._waiting_set.add(order.order_id)
 
-        severity = AlertSeverity.HIGH if order.priority >= 3 else AlertSeverity.MEDIUM
+        urgency = order.get_urgency(self.urgency_map)
+        if urgency.value >= UrgencyLevel.CRITICAL.value or effective_priority >= 8:
+            alert_severity = AlertSeverity.CRITICAL
+        elif urgency.value >= UrgencyLevel.HIGH.value or effective_priority >= 4:
+            alert_severity = AlertSeverity.HIGH
+        else:
+            alert_severity = AlertSeverity.MEDIUM
+
         self._raise_alert(
-            severity,
+            alert_severity,
             "工单进入等待队列",
             f"订单 {order.order_id} ({order.description}) 因【{reason}】进入等待队列，"
-            f"优先级 {order.priority}，当前队列长度 {len(self._waiting_queue)}",
+            f"优先级 {order.priority}，紧急程度 {urgency.name}，"
+            f"综合优先级 {effective_priority:.0f}，当前队列长度 {len(self._waiting_queue)}",
             order_id=order.order_id,
         )
 
@@ -272,9 +321,10 @@ class DispatchService:
 
         candidates: List[Tuple[Worker, AssignmentResult]] = []
         best_skill_match = False
+        urgency = order.get_urgency(self.urgency_map)
 
         for worker in eligible_workers:
-            total_score, skill_score, distance_score, load_score, rating_score = (
+            total_score, skill_score, distance_score, load_score, rating_score, urgency_score = (
                 self._calculate_total_score(worker, order)
             )
             distance = worker.location.distance_to(order.location)
@@ -295,7 +345,8 @@ class DispatchService:
                     f"技能匹配:{skill_score:.0%}, "
                     f"距离得分:{distance_score:.0%}, "
                     f"负载得分:{load_score:.0%}, "
-                    f"评分得分:{rating_score:.0%}"
+                    f"评分得分:{rating_score:.0%}, "
+                    f"紧急程度:{urgency.name}({urgency_score:.0%})"
                 ),
             )
             candidates.append((worker, result))
@@ -544,10 +595,11 @@ class DispatchService:
 
         order = self.orders[order_id]
         eligible_workers = self._get_eligible_workers(order)
+        urgency = order.get_urgency(self.urgency_map)
 
         results = []
         for worker in eligible_workers:
-            total_score, skill_score, distance_score, load_score, rating_score = (
+            total_score, skill_score, distance_score, load_score, rating_score, urgency_score = (
                 self._calculate_total_score(worker, order)
             )
             distance = worker.location.distance_to(order.location)
@@ -564,7 +616,8 @@ class DispatchService:
                         f"技能匹配:{skill_score:.0%}, "
                         f"距离得分:{distance_score:.0%}, "
                         f"负载得分:{load_score:.0%}, "
-                        f"评分得分:{rating_score:.0%}"
+                        f"评分得分:{rating_score:.0%}, "
+                        f"紧急程度:{urgency.name}({urgency_score:.0%})"
                     ),
                 )
             )
